@@ -1,53 +1,90 @@
-# 1. 导入必要模块
-from unsloth import FastLanguageModel
+from __future__ import annotations
+
 import os
-import torch
+from dataclasses import dataclass
+from pathlib import Path
+
 from datasets import load_dataset
-from trl import SFTTrainer, SFTConfig
 from torch.utils.tensorboard import SummaryWriter
+from trl import SFTConfig, SFTTrainer
+from unsloth import FastLanguageModel
 
-# 2. 环境设置
-os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
-writer = SummaryWriter(log_dir="./train_logs_sft_hotpotqa")
-print(f"Current PID: {os.getpid()}")
+try:
+    from src.config import DEFAULT_SFT_DATASET_PATH, ROOT_DIR, ensure_directory
+    from src.logging_utils import get_logger
+except ImportError:
+    from config import DEFAULT_SFT_DATASET_PATH, ROOT_DIR, ensure_directory
+    from logging_utils import get_logger
 
-# 3. 加载并预处理HotpotQA SFT格式数据
-def load_hotpotqa_data(json_file):
-    dataset = load_dataset('json', data_files=json_file, split='train')
-    print(f"Loaded {len(dataset)} examples from {json_file}")
-    
-    # 转换为对话格式
+
+logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class SftTrainingConfig:
+    dataset_path: str = str(DEFAULT_SFT_DATASET_PATH)
+    model_name: str = "Qwen/Qwen2.5-3B-Instruct"
+    log_dir: str = str(ROOT_DIR / "train_logs_sft_hotpotqa")
+    output_dir: str = str(ROOT_DIR / "hotpotqa_sft_model/outputs")
+    lora_output_dir: str = str(ROOT_DIR / "hotpotqa_sft_model/sft_loras")
+    max_seq_length: int = 4096
+    lora_rank: int = 64
+    gpu_memory_utilization: float = 0.4
+
+
+def load_hotpotqa_data(json_file: str):
+    dataset = load_dataset("json", data_files=json_file, split="train")
+    logger.info("Loaded %s examples from %s", len(dataset), json_file)
+
     def convert_to_chat(example):
         return {
             "messages": [
-                {"role": "system", "content": "Extract the most relevant statements related to the question from the information below. "},
-                {"role": "user", "content": "Question:"+example["input"]},
-                {"role": "assistant", "content": "Answer:"+example["output"]}
+                {
+                    "role": "system",
+                    "content": "Extract the most relevant statements related to the question from the information below. ",
+                },
+                {"role": "user", "content": "Question:" + example["input"]},
+                {"role": "assistant", "content": "Answer:" + example["output"]},
             ]
         }
-    
+
     dataset = dataset.map(convert_to_chat, batched=False)
     return dataset.remove_columns(["input", "output"])
 
-dataset = load_hotpotqa_data("Hotpotqa_sft.json")
 
-# 4. 加载模型和分词器
-model_name = "Qwen/Qwen2.5-3B-Instruct"
-max_seq_length = 4096  # 根据需求调整
-lora_rank = 64
+def formatting_prompts_func(tokenizer, examples):
+    texts = []
+    for messages in examples["messages"]:
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        ) + tokenizer.eos_token
+        texts.append(text)
+    return texts
 
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=model_name,
-    max_seq_length=max_seq_length,
-    load_in_4bit=True,
-    fast_inference=True,
-    max_lora_rank=lora_rank,
-    gpu_memory_utilization=0.4,
-    device_map='cuda'
-)
 
-# 5. 设置Qwen聊天模板
-tokenizer.chat_template = """
+def main() -> None:
+    config = SftTrainingConfig()
+    os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
+    ensure_directory(Path(config.log_dir))
+    ensure_directory(Path(config.output_dir).parent)
+    ensure_directory(Path(config.lora_output_dir).parent)
+    SummaryWriter(log_dir=config.log_dir)
+    logger.info("Current PID: %s", os.getpid())
+
+    dataset = load_hotpotqa_data(config.dataset_path)
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=config.model_name,
+        max_seq_length=config.max_seq_length,
+        load_in_4bit=True,
+        fast_inference=True,
+        max_lora_rank=config.lora_rank,
+        gpu_memory_utilization=config.gpu_memory_utilization,
+        device_map="cuda",
+    )
+
+    tokenizer.chat_template = """
 {% for message in messages %}
 {% if message.role == 'system' %}<|im_start|>system\n{{ message.content }}<|im_end>\n{% endif %}
 {% if message.role == 'user' %}<|im_start|>user\n{{ message.content }}<|im_end>\n{% endif %}
@@ -55,58 +92,50 @@ tokenizer.chat_template = """
 {% endfor %}
 """
 
-# 6. 配置LoRA
-model = FastLanguageModel.get_peft_model(
-    model,
-    r=lora_rank,
-    target_modules=[
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj"
-    ],
-    lora_alpha=lora_rank,
-    use_gradient_checkpointing="unsloth",
-    random_state=3407
-)
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=config.lora_rank,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        lora_alpha=config.lora_rank,
+        use_gradient_checkpointing="unsloth",
+        random_state=3407,
+    )
 
-# 7. 定义格式化函数
-def formatting_prompts_func(examples):
-    texts = []
-    for messages in examples["messages"]:
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False
-        ) + tokenizer.eos_token
-        texts.append(text)
-    return texts
+    training_args = SFTConfig(
+        output_dir=config.output_dir,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=16,
+        learning_rate=2e-5,
+        logging_steps=10,
+        num_train_epochs=2,
+        report_to="tensorboard",
+        logging_dir=config.log_dir,
+        max_seq_length=config.max_seq_length,
+        bf16=True,
+        save_strategy="steps",
+        save_steps=500,
+        lr_scheduler_type="cosine",
+        warmup_steps=30,
+    )
 
-# 8. 配置训练参数
-training_args = SFTConfig(
-    output_dir="./hotpotqa_sft_model/outputs",
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=16,
-    learning_rate=2e-5,
-    logging_steps=10,
-    num_train_epochs=2,
-    report_to="tensorboard",
-    logging_dir="./train_logs_sft_hotpotqa",
-    max_seq_length=max_seq_length,
-    bf16=True,
-    save_strategy="steps",
-    save_steps=500,
-    lr_scheduler_type="cosine",
-    warmup_steps=30,
-)
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        args=training_args,
+        train_dataset=dataset,
+        formatting_func=lambda examples: formatting_prompts_func(tokenizer, examples),
+    )
+    trainer.train()
+    model.save_lora(config.lora_output_dir)
 
-# 9. 初始化Trainer
-trainer = SFTTrainer(
-    model=model,
-    tokenizer=tokenizer,
-    args=training_args,
-    train_dataset=dataset,
-    formatting_func=formatting_prompts_func,
-)
 
-# 10. 开始训练
-trainer.train()
-model.save_lora("./hotpotqa_sft_model/sft_loras")
+if __name__ == "__main__":
+    main()

@@ -1,380 +1,271 @@
+from __future__ import annotations
+
 import json
 import re
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any
 
-def preprocess_hotpot_file(file_path):
-    """
-    处理HotpotQA数据集的预处理函数
-    context结构: [[title, [sentences]], ...] 的二维列表
-    supporting_facts结构: [[title, sent_id], ...] 的二维列表
+try:
+    from src.workflow_schema import ContextDocument, QuestionSample
+    from src.agent_prompts import (
+        build_answer_prompt,
+        build_filter_prompt,
+        build_teacher_answer_prompt,
+        build_teacher_filter_prompt,
+    )
+except ImportError:
+    from workflow_schema import ContextDocument, QuestionSample
+    from agent_prompts import (
+        build_answer_prompt,
+        build_filter_prompt,
+        build_teacher_answer_prompt,
+        build_teacher_filter_prompt,
+    )
 
-    返回: [{
-        'id': str,
-        'model_input': {'context': str, 'question': str},
-        'answer': str,
-        'type': str,
-        'level': str,
-        'supporting_facts': list  # 实际为[[title, sent_id], ...]
-    }, ...]
-    """
-    with open(file_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    
-    processed = []
-    for item in data:
-        # 处理context结构（现在是[title, sentences_list]的列表）
-        context_parts = []
-        for para in item['context']:
-            title = para[0]  # 第一个元素是标题
-            sentences = " ".join(para[1])  # 第二个元素是句子列表
-            context_parts.append(f"{title}:\n {sentences}\n")
-        
-        context = ". ".join(context_parts)  # 用句号+空格连接不同段落
-        
-        # 构建新字典
-        processed.append({
-            'id': item['_id'],
-            'model_input': {
-                'context': context,
-                'question': item['question']
-            },
-            'answer': item['answer'],
-            'type': item['type'],
-            'level': item['level'],
-            'supporting_facts': item['supporting_facts']
-        })
-    
-    return processed
 
-def refine_for_fliter_input(data_item: dict) -> str:
+HotpotContext = list[list[Any]]
+ProcessedSample = dict[str, Any]
+
+
+def format_context(context_items: HotpotContext) -> str:
+    context_parts: list[str] = []
+    for title, sentences in context_items:
+        sentence_block = " ".join(sentences)
+        context_parts.append(f"{title}:\n {sentence_block}\n")
+    return ". ".join(context_parts)
+
+
+def load_hotpot_samples(file_path: str | Path) -> list[QuestionSample]:
+    with open(file_path, "r", encoding="utf-8") as handle:
+        raw_data = json.load(handle)
+
+    samples: list[QuestionSample] = []
+    for item in raw_data:
+        context_documents = tuple(
+            ContextDocument(
+                title=str(title),
+                sentences=tuple(str(sentence) for sentence in sentences),
+            )
+            for title, sentences in item["context"]
+        )
+        supporting_facts = tuple(
+            (str(title), int(sentence_index))
+            for title, sentence_index in item["supporting_facts"]
+        )
+        samples.append(
+            QuestionSample(
+                sample_id=str(item["_id"]),
+                question=str(item["question"]),
+                answer=str(item["answer"]),
+                question_type=str(item["type"]),
+                level=str(item["level"]),
+                supporting_facts=supporting_facts,
+                context_documents=context_documents,
+            )
+        )
+    return samples
+
+
+def preprocess_hotpot_file(file_path: str | Path) -> list[ProcessedSample]:
     """
-    将预处理后的数据润色为更自然的LLM输入格式
-    
-    Args:
-        data_item: preprocess_hotpot_file()输出的单个元素
-        
-    Returns:
-        润色后的自然语言提示字符串
+    Preserve the legacy processed-sample structure used by older scripts.
     """
-    context = data_item['model_input']['context']
-    question = data_item['model_input']['question']
-    
-    return f"""System:Respond in following format:<Info>...</Info><Answer>...</Answer>
-{context}
-Of the information above, find out the original text that is of most concern to the following question:
-{question}
-Put them into <Info></Info>
-"""
+    return [sample.to_processed_sample() for sample in load_hotpot_samples(file_path)]
+
+
+def processed_sample_to_question_sample(data_item: ProcessedSample) -> QuestionSample:
+    context_documents = tuple(
+        ContextDocument(title=title, sentences=(content,))
+        for title, content in parse_context_string(data_item["model_input"]["context"]).items()
+    )
+    supporting_facts = tuple(
+        (str(title), int(sentence_index))
+        for title, sentence_index in data_item.get("supporting_facts", [])
+    )
+    return QuestionSample(
+        sample_id=str(data_item["id"]),
+        question=str(data_item["model_input"]["question"]),
+        answer=str(data_item.get("answer", "")),
+        question_type=str(data_item.get("type", "")),
+        level=str(data_item.get("level", "")),
+        supporting_facts=supporting_facts,
+        context_documents=context_documents,
+    )
+
+
+def refine_for_filter_input(data_item: ProcessedSample | QuestionSample) -> str:
+    sample = _coerce_to_question_sample(data_item)
+    return build_filter_prompt(sample)
+
+
+def refine_for_fliter_input(data_item: ProcessedSample | QuestionSample) -> str:
+    return refine_for_filter_input(data_item)
+
 
 def extract_info_from_response(response_text: str) -> str:
-    """
-    从模型响应文本中提取<Info>标签内的内容
-    
-    Args:
-        response_text: 包含<Info>标签的文本字符串
-        
-    Returns:
-        <Info>标签内的内容字符串（不包含标签本身）
-        如果未找到则返回空字符串
-    """
-    pattern = r'<Info>(.*?)</Info>'
-    match = re.search(pattern, response_text, re.DOTALL)
+    match = re.search(r"<Info>(.*?)</Info>", response_text, re.DOTALL)
     return match.group(1).strip() if match else ""
 
-def refine_for_teacher_judge_fliter(filtered_info: str, data_item: dict) -> str:
-    """
-    生成评估信息相关性的提示
-    
-    Args:
-        filtered_info: 从模型响应中提取的信息片段
-        data_item: 原始数据项(包含context和question)
-        
-    Returns:
-        格式化后的评估提示字符串
-    """
-    context = data_item['model_input']['context']
-    question = data_item['model_input']['question']
-    
-    return f"""Context:
-{context}
 
-Question: {question}
+def refine_for_teacher_judge_filter(
+    filtered_info: str,
+    data_item: ProcessedSample | QuestionSample,
+) -> str:
+    sample = _coerce_to_question_sample(data_item)
+    return build_teacher_filter_prompt(filtered_info, sample)
 
-Please decide whether the info given below is from the content above, and whether it is strongly related to the question. If both conditions are met, answer 'yes', otherwise 'no'.
 
-Info: {filtered_info}
-"""
+def refine_for_teacher_judge_fliter(
+    filtered_info: str,
+    data_item: ProcessedSample | QuestionSample,
+) -> str:
+    return refine_for_teacher_judge_filter(filtered_info, data_item)
+
 
 def teacher_agent_judge(response: str) -> str:
-    """
-    根据输入字符串判断返回YES或NO
-    
-    Args:
-        response: 待判断的字符串
-        
-    Returns:
-        "YES" 如果字符串中包含'yes'(不区分大小写)
-        "NO" 如果字符串中包含'no'(不区分大小写)
-        默认返回"NO"
-    """
-    response_lower = response.lower()
-    if 'yes' in response_lower:
+    lowered = response.lower()
+    has_yes = bool(re.search(r"\byes\b", lowered))
+    has_no = bool(re.search(r"\bno\b", lowered))
+    has_unknown = bool(re.search(r"\bunknown\b", lowered))
+
+    if has_unknown or (has_yes and has_no) or (not has_yes and not has_no):
+        return "UNKNOWN"
+    if has_yes:
         return "YES"
-    elif 'no' in response_lower:
-        return "NO"
-    return "YES"  # 默认情况
+    return "NO"
 
-def refine_for_answer_agent(filtered_info: str, question_content: str,context) -> str:
-    """
-    生成信息相关性评估的标准提示
-    
-    Args:
-        filtered_info: 从内容中提取的关键信息片段
-        question_content: 需要评估的问题
-        
-    Returns:
-        格式化后的评估提示字符串
-    """
-    return f"""\nUser:
-    Question: {question_content}
-    Key infomation:{filtered_info}
-    Other Info:{context}
-Answer:"""
 
+def refine_for_answer_agent(
+    filtered_info: str,
+    question_content: str,
+    context: str = "",
+) -> str:
+    return build_answer_prompt(filtered_info, question_content, context)
 
 
 def refine_for_teacher_judge_answer(prompt: str, answer: str) -> str:
-    """
-    Generate an evaluation prompt for judging the reasonableness of a QA pair
-    
-    Args:
-        prompt: The question being evaluated
-        answer: The answer to be judged
-        
-    Returns:
-        Formatted evaluation prompt string
-    """
-    return f"""Please decide whether this Question-Answer Pair is reasonable, and whether there is any obvious reasoning error.
-If there is no error (reasonable), please output 'yes', otherwise please output 'no'.
+    return build_teacher_answer_prompt(prompt, answer)
 
-Question: {prompt}
-Answer: {answer}
 
-Judgment:"""
+def transform_hotpotqa_to_sft(input_file: str | Path, output_file: str | Path) -> None:
+    with open(input_file, "r", encoding="utf-8") as handle:
+        raw_data = json.load(handle)
 
-def transform_hotpotqa_to_sft(input_file, output_file):
-    """
-    将HotpotQA原始数据转换为SFT格式
-    
-    参数:
-        input_file: 原始HotpotQA JSON文件路径
-        output_file: 输出JSON文件路径
-    """
-    # 读取原始数据
-    with open(input_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    
-    # 转换数据
-    sft_data = []
-    for item in data:
-        # 提取问题
-        question = item['question']
-        
-        # 构建上下文字符串
-        context_parts = []
-        for title, sentences in item['context']:
+    sft_data: list[dict[str, str]] = []
+    for item in raw_data:
+        context_parts: list[str] = []
+        for title, sentences in item["context"]:
             context_parts.append(f"Title: {title}")
             context_parts.extend(sentences)
         context = "\n".join(context_parts)
-        
-        # 提取支持事实的完整句子
-        support_sentences = []
-        for fact in item['supporting_facts']:
-            title, sent_idx = fact
-            # 在上下文中找到对应的标题和句子
-            for ctx_title, sentences in item['context']:
+
+        support_sentences: list[str] = []
+        for title, sent_idx in item["supporting_facts"]:
+            for ctx_title, sentences in item["context"]:
                 if ctx_title == title and sent_idx < len(sentences):
                     support_sentences.append(sentences[sent_idx])
                     break
-        
-        # 构建输入输出对
-        sft_item = {
-            "input": f"{question}\n{context}",
-            "output": "\n".join(support_sentences)
-        }
-        sft_data.append(sft_item)
-    
-    # 写入新文件
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(sft_data, f, ensure_ascii=False, indent=2)
 
-import json
-import re # Import the regular expression module
-import difflib
+        sft_data.append(
+            {
+                "input": f"{item['question']}\n{context}",
+                "output": "\n".join(support_sentences),
+            }
+        )
 
-def extract_entity_perspective(text):
-    """
-    Extracts 'entity' and 'perspective' from a string that may contain
-    JSON-like content, even if it has extra surrounding text or minor
-    formatting issues.
-
-    Prioritizes parsing a valid JSON object if one can be isolated.
-    Falls back to regular expressions if JSON parsing fails.
-
-    Args:
-        text: The input string from the Teacher Agent.
-
-    Returns:
-        A tuple containing (entity, perspective). Returns (None, None)
-        if neither method successfully extracts both values.
-    """
-    entity = None
-    perspective = None
-
-    # --- Method 1: Attempt to isolate and parse JSON object ---
-    try:
-        # Find the first '{' and the last '}'
-        start_index = text.find('{')
-        end_index = text.rfind('}') # Use rfind to find the last occurrence
-
-        if start_index != -1 and end_index != -1 and start_index < end_index:
-            # Extract the substring between the first { and the last }
-            json_substring = text[start_index : end_index + 1]
-
-            # Attempt to parse the substring as JSON
-            data = json.loads(json_substring)
-
-            # Extract values if parsing was successful
-            entity = data.get("entity")
-            perspective = data.get("perspective")
-
-            # If both are found via JSON, we're done
-            if entity is not None and perspective is not None:
-                # print("Extraction Method: JSON Parsing") # Optional debug
-                return entity, perspective
-
-    except json.JSONDecodeError:
-        # JSON parsing failed, continue to fallback method
-        # print("JSON parsing failed, attempting regex fallback.") # Optional debug
-        pass # Don't return, proceed to regex
-    except Exception as e:
-        # Handle any other unexpected errors during JSON parsing attempt
-        print(f"An unexpected error occurred during JSON parsing attempt: {e}")
-        pass # Don't return, proceed to regex
+    with open(output_file, "w", encoding="utf-8") as handle:
+        json.dump(sft_data, handle, ensure_ascii=False, indent=2)
 
 
-    # --- Method 2: Fallback using Regular Expressions ---
-    # This is less strict and can find patterns even if the overall structure is broken.
-    # Pattern to find '"key": "value"' (non-greedy match for the value)
-    entity_pattern = r'"entity":\s*"(.*?)"'
-    perspective_pattern = r'"perspective":\s*"(.*?)"'
-
-    try:
-        # Search for the entity pattern
-        entity_match = re.search(entity_pattern, text)
-        if entity_match:
-            entity = entity_match.group(1) # group(1) captures the content inside the quotes
-
-        # Search for the perspective pattern
-        perspective_match = re.search(perspective_pattern, text)
-        if perspective_match:
-            perspective = perspective_match.group(1) # group(1) captures the content inside the quotes
-
-        # print("Extraction Method: Regex Fallback") # Optional debug
+def extract_entity_perspective(text: str) -> tuple[str | None, str | None]:
+    entity, perspective = _extract_entity_perspective_from_json(text)
+    if entity is not None or perspective is not None:
         return entity, perspective
+    return _extract_entity_perspective_with_regex(text)
 
-    except Exception as e:
-        print(f"An unexpected error occurred during regex fallback: {e}")
-        return None, None # Return None, None on any error in regex
 
-    # If neither method worked well enough (e.g., regex didn't find both), we reach here
-    # print("Warning: Could not fully extract entity and perspective using either method.") # Optional debug
-    # The current values (potentially None) will be returned
+def _extract_entity_perspective_from_json(text: str) -> tuple[str | None, str | None]:
+    start_index = text.find("{")
+    end_index = text.rfind("}")
+    if start_index == -1 or end_index == -1 or start_index >= end_index:
+        return None, None
+
+    try:
+        data = json.loads(text[start_index : end_index + 1])
+    except json.JSONDecodeError:
+        return None, None
+
+    return data.get("entity"), data.get("perspective")
+
+
+def _extract_entity_perspective_with_regex(text: str) -> tuple[str | None, str | None]:
+    entity_match = re.search(r'"entity":\s*"(.*?)"', text)
+    perspective_match = re.search(r'"perspective":\s*"(.*?)"', text)
+    entity = entity_match.group(1) if entity_match else None
+    perspective = perspective_match.group(1) if perspective_match else None
     return entity, perspective
 
 
-import re
-from difflib import SequenceMatcher
-
-def extract_matching_info(data_string, query_string, fuzzy_threshold=0.8):
-    """
-    从总信息字符串中提取匹配查询字符串的信息
-    
-    Args:
-        data_string (str): 包含所有信息的长字符串（格式：title:\n content\n. title:\n content...）
-        query_string (str): 查询字符串（例如："我想要知道Melanie Oudin和Ted Schroeder"）
-        fuzzy_threshold (float): 模糊匹配阈值，默认0.8
-    
-    Returns:
-        str: 提取到的匹配信息字符串，如果没有匹配则返回空字符串
-    """
-    
-    def parse_data_string(data_str):
-        """解析数据字符串，提取title和内容"""
-        players_info = {}
-        entries = data_str.split('\n. ')
-        
-        for entry in entries:
-            entry = entry.strip()
-            if not entry:
-                continue
-                
-            colon_pos = entry.find(':\n')
-            if colon_pos != -1:
-                title = entry[:colon_pos].strip()
-                content = entry[colon_pos + 2:].strip()
-                
-                # 清理title开头可能的点号
-                if title.startswith('. '):
-                    title = title[2:]
-                
-                players_info[title] = content
-        
-        return players_info
-    
-    def find_matches(query_str, info_dict, threshold):
-        """查找匹配的信息"""
-        matched_info = {}
-        query_lower = query_str.lower()
-        
-        for title, content in info_dict.items():
-            title_lower = title.lower()
-            
-            # 精确匹配
-            if title_lower in query_lower:
-                matched_info[title] = content
-                continue
-            
-            # 模糊匹配
-            query_words = re.findall(r'\b\w+\b', query_lower)
-            title_words = re.findall(r'\b\w+\b', title_lower)
-            
-            for title_word in title_words:
-                if len(title_word) < 3:  # 跳过过短的词
-                    continue
-                for query_word in query_words:
-                    if len(query_word) < 3:  # 跳过过短的词
-                        continue
-                    similarity = SequenceMatcher(None, title_word, query_word).ratio()
-                    if similarity >= threshold:
-                        matched_info[title] = content
-                        break
-                if title in matched_info:
-                    break
-        
-        return matched_info
-    
-    # 解析数据
-    parsed_info = parse_data_string(data_string)
-    
-    # 查找匹配
-    matches = find_matches(query_string, parsed_info, fuzzy_threshold)
-    
-    # 构建结果字符串
+def extract_matching_info(
+    data_string: str,
+    query_string: str,
+    fuzzy_threshold: float = 0.8,
+) -> str:
+    parsed_info = parse_context_string(data_string)
+    matches = find_matching_entries(query_string, parsed_info, fuzzy_threshold)
     if not matches:
         return ""
-    
-    result_parts = []
-    for title, content in matches.items():
-        result_parts.append(f"{title}:\n{content}")
-    
-    return "\n. ".join(result_parts)
+    return "\n. ".join(f"{title}:\n{content}" for title, content in matches.items())
+
+
+def parse_context_string(data_string: str) -> dict[str, str]:
+    parsed_entries: dict[str, str] = {}
+    for entry in data_string.split("\n. "):
+        cleaned_entry = entry.strip()
+        if not cleaned_entry:
+            continue
+
+        colon_position = cleaned_entry.find(":\n")
+        if colon_position == -1:
+            continue
+
+        title = cleaned_entry[:colon_position].strip()
+        content = cleaned_entry[colon_position + 2 :].strip()
+        if title.startswith(". "):
+            title = title[2:]
+        parsed_entries[title] = content
+
+    return parsed_entries
+
+
+def find_matching_entries(
+    query_string: str,
+    parsed_entries: dict[str, str],
+    fuzzy_threshold: float,
+) -> dict[str, str]:
+    matches: dict[str, str] = {}
+    query_lower = query_string.lower()
+    query_words = [word for word in re.findall(r"\b\w+\b", query_lower) if len(word) >= 3]
+
+    for title, content in parsed_entries.items():
+        title_lower = title.lower()
+        if title_lower in query_lower:
+            matches[title] = content
+            continue
+
+        title_words = [word for word in re.findall(r"\b\w+\b", title_lower) if len(word) >= 3]
+        if any(
+            SequenceMatcher(None, title_word, query_word).ratio() >= fuzzy_threshold
+            for title_word in title_words
+            for query_word in query_words
+        ):
+            matches[title] = content
+
+    return matches
+
+
+def _coerce_to_question_sample(data_item: ProcessedSample | QuestionSample) -> QuestionSample:
+    if isinstance(data_item, QuestionSample):
+        return data_item
+    return processed_sample_to_question_sample(data_item)

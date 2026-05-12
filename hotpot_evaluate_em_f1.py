@@ -1,76 +1,58 @@
-import sys
+from __future__ import annotations
+
 import json
-import re
-import string
-from collections import Counter
+import sys
+from pathlib import Path
 
-def normalize_answer(s):
-    """标准化答案文本（移除非关键字符）"""
-    def remove_articles(text):
-        return re.sub(r'\b(a|an|the)\b', ' ', text)
-    def white_space_fix(text):
-        return ' '.join(text.split())
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return ''.join(ch for ch in text if ch not in exclude)
-    def lower(text):
-        return text.lower()
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
+from src.text_metrics import normalize_answer, token_f1
 
-def f1_score(prediction, truth):
-    """计算F1分数"""
-    pred_tokens = normalize_answer(prediction).split()
-    truth_tokens = normalize_answer(truth).split()
-    
-    # 处理yes/no特殊情形
-    if (pred_tokens in [['yes'], ['no'], ['noanswer']] or 
-        truth_tokens in [['yes'], ['no'], ['noanswer']]):
-        return int(pred_tokens == truth_tokens)
-    
-    common = Counter(pred_tokens) & Counter(truth_tokens)
-    overlap = sum(common.values())
-    if overlap == 0:
-        return 0
-    
-    precision = overlap / len(pred_tokens)
-    recall = overlap / len(truth_tokens)
-    return 2 * (precision * recall) / (precision + recall)
 
-def evaluate(pred_file, gold_file):
-    """执行评估"""
-    with open(pred_file) as f:
-        preds = json.load(f)  # 格式: {"qid1": "answer1", "qid2": "answer2"}
-    with open(gold_file) as f:
-        golds = json.load(f)  # 格式: [{"_id": "qid1", "answer": "truth1"}, ...]
-    
-    # 转换为 {qid: answer} 格式
+def f1_score(prediction: str, truth: str) -> float:
+    return token_f1(prediction, truth, remove_articles=True)
+
+
+def evaluate(pred_file: str | Path, gold_file: str | Path) -> dict[str, float]:
+    with open(pred_file, "r", encoding="utf-8") as pred_handle:
+        preds = json.load(pred_handle)
+    with open(gold_file, "r", encoding="utf-8") as gold_handle:
+        golds = json.load(gold_handle)
+
     gold_dict = {item["_id"]: item["answer"] for item in golds}
-    
-    total_em = 0
-    total_f1 = 0
+    total_em = 0.0
+    total_f1 = 0.0
     count = 0
-    
+
     for qid, pred_ans in preds.items():
         if qid not in gold_dict:
             print(f"警告: 预测中存在未知问题ID {qid}")
             continue
-            
-        truth_ans = gold_dict[qid]
-        # 计算EM
-        em = int(normalize_answer(pred_ans) == normalize_answer(truth_ans))
-        # 计算F1
-        f1 = f1_score(pred_ans, truth_ans)
-        
-        total_em += em
-        total_f1 += f1
-        count += 1
-    
-    print(f"评估结果 (共 {count} 条):")
-    print(f"Exact Match (EM): {total_em/count:.4f}")
-    print(f"F1 Score: {total_f1/count:.4f}")
 
-if __name__ == '__main__':
-    if len(sys.argv) != 3:
-        print("用法: python hotpot_evaluate_em&f1.py [预测文件.json] [标准答案文件.json]")
-        sys.exit(1)
-    evaluate(sys.argv[1], sys.argv[2])
+        truth_ans = gold_dict[qid]
+        total_em += float(normalize_answer(pred_ans) == normalize_answer(truth_ans))
+        total_f1 += f1_score(pred_ans, truth_ans)
+        count += 1
+
+    if count == 0:
+        raise ValueError("No overlapping question IDs found between prediction and gold files.")
+
+    metrics = {
+        "count": float(count),
+        "em": total_em / count,
+        "f1": total_f1 / count,
+    }
+    print(f"评估结果 (共 {count} 条):")
+    print(f"Exact Match (EM): {metrics['em']:.4f}")
+    print(f"F1 Score: {metrics['f1']:.4f}")
+    return metrics
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 3:
+        print("用法: python hotpot_evaluate_em_f1.py [预测文件.json] [标准答案文件.json]")
+        return 1
+    evaluate(argv[1], argv[2])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

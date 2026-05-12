@@ -1,0 +1,10 @@
+datasets
+openai
+peft
+pytest
+torch
+transformers
+trl
+tqdm
+unsloth
+vllm
